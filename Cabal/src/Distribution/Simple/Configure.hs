@@ -343,9 +343,23 @@ writePersistBuildConfig mbWorkDir distPref lbi = do
   createDirectoryIfMissing False (i distPref)
   writeFileAtomic (i $ localBuildInfoFile distPref) $
     BLC8.unlines [showHeader pkgId, structuredEncode lbi]
+  dumpLBI lbi
   where
     i = interpretSymbolicPath mbWorkDir -- See Note [Symbolic paths] in Distribution.Utils.Path
     pkgId = localPackage lbi
+
+-- | Dump 'LocalBuildInfo' to file when the @CABAL_LBI_DUMP_DIR@ environment
+-- variable is set.
+dumpLBI :: LocalBuildInfo -> IO ()
+dumpLBI lbi = do
+  mbDumpDir <- lookupEnv "CABAL_LBI_DUMP_DIR"
+  case mbDumpDir of
+    Nothing -> return ()
+    Just dumpDir -> do
+      let uid = prettyShow (localUnitId lbi)
+          dumpFile = dumpDir </> uid <> ".lbi"
+      createDirectoryIfMissing True dumpDir
+      writeFile dumpFile (show lbi)
 
 -- | Identifier of the current Cabal package.
 currentCabalId :: PackageIdentifier
