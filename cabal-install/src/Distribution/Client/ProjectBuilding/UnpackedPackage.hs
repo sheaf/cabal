@@ -90,6 +90,8 @@ import Distribution.Simple.LocalBuildInfo
   , LibraryName (..)
   )
 import qualified Distribution.Simple.LocalBuildInfo as Cabal
+import Distribution.Simple.PackageIndex (InstalledPackageIndex)
+import qualified Distribution.Simple.PackageIndex as PackageIndex
 import Distribution.Simple.Program
 import qualified Distribution.Simple.Register as Cabal
 import qualified Distribution.Simple.Setup as Cabal
@@ -113,6 +115,7 @@ import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBS.Char8
 import qualified Data.List.NonEmpty as NE
 
+import Control.Concurrent.STM (TVar, atomically, modifyTVar)
 import Control.Exception (ErrorCall, Handler (..), SomeAsyncException, assert, catches, onException)
 import GHC.Clock (getMonotonicTime)
 import System.Directory (canonicalizePath, createDirectoryIfMissing, doesDirectoryExist, listDirectory)
@@ -149,6 +152,9 @@ data PackageBuildingPhase r where
           :: PackageDBStackCWD
           -> Cabal.RegisterOptions
           -> IO InstalledPackageInfo
+       , getInstalledPackageInfo :: IO InstalledPackageInfo
+        -- ^ Compute the 'InstalledPackageInfo' from the build output,
+        -- without registering with @ghc-pkg@. Deterministic.
        }
     -> PackageBuildingPhase ()
   PBTestPhase :: {runTest :: IO ()} -> PackageBuildingPhase ()
@@ -171,6 +177,9 @@ buildAndRegisterUnpackedPackage
   -> ElaboratedSharedConfig
   -> ElaboratedInstallPlan
   -> ElaboratedReadyPackage
+  -> TVar InstalledPackageIndex
+  -- ^ Running 'InstalledPackageIndex', updated as @cabal-install@ registers
+  -- packages
   -> SymbolicPath CWD (Dir Pkg)
   -> SymbolicPath Pkg (Dir Dist)
   -> Maybe FilePath
@@ -193,6 +202,7 @@ buildAndRegisterUnpackedPackage
     }
   plan
   rpkg@(ReadyPackage pkg)
+  ipiTVar
   srcdir
   builddir
   mlogFile
@@ -207,7 +217,7 @@ buildAndRegisterUnpackedPackage
               Cabal.configCommonFlags
               configureFlags
               configureArgs
-              (InLibraryArgs $ InLibraryConfigureArgs pkgshared rpkg)
+              (InLibraryArgs $ InLibraryConfigureArgs pkgshared rpkg ipiTVar)
 
     -- Build phase
     timedDelegate $
@@ -233,6 +243,11 @@ buildAndRegisterUnpackedPackage
               (InLibraryArgs $ InLibraryPostConfigureArgs SHaddockPhase mbLBI)
 
     -- Install phase
+    let getIpkg = do
+          -- Grab and modify the InstalledPackageInfo. We decide what
+          -- the installed package id is, not the build system.
+          ipkg0 <- generateInstalledPackageInfo mbLBI
+          return ipkg0{Installed.installedUnitId = uid}
     timedDelegate $
       PBInstallPhase
         { runCopy = \destdir ->
@@ -245,11 +260,8 @@ buildAndRegisterUnpackedPackage
                 (InLibraryArgs $ InLibraryPostConfigureArgs SCopyPhase mbLBI)
         , runRegister = \pkgDBStack registerOpts ->
             annotateFailure mlogFile InstallFailed $ do
-              -- We register ourselves rather than via Setup.hs. We need to
-              -- grab and modify the InstalledPackageInfo. We decide what
-              -- the installed package id is, not the build system.
-              ipkg0 <- generateInstalledPackageInfo mbLBI
-              let ipkg = ipkg0{Installed.installedUnitId = uid}
+              -- We register ourselves, rather than via Setup.hs.
+              ipkg <- getIpkg
               criticalSection registerLock $
                 Cabal.registerPackage
                   verbosity
@@ -260,6 +272,7 @@ buildAndRegisterUnpackedPackage
                   ipkg
                   registerOpts
               return ipkg
+        , getInstalledPackageInfo = getIpkg
         }
 
     -- Test phase
@@ -515,6 +528,7 @@ buildInplaceUnpackedPackage
   -> ElaboratedSharedConfig
   -> ElaboratedInstallPlan
   -> ElaboratedReadyPackage
+  -> TVar InstalledPackageIndex
   -> BuildStatusRebuild
   -> SymbolicPath CWD (Dir Pkg)
   -> SymbolicPath Pkg (Dir Dist)
@@ -533,6 +547,7 @@ buildInplaceUnpackedPackage
   pkgshared@ElaboratedSharedConfig{pkgConfigPlatform = Platform _ os}
   plan
   rpkg@(ReadyPackage pkg)
+  ipiTVar
   buildStatus
   srcdir
   builddir = do
@@ -555,6 +570,7 @@ buildInplaceUnpackedPackage
       pkgshared
       plan
       rpkg
+      ipiTVar
       srcdir
       builddir
       Nothing -- no log file for inplace builds!
@@ -607,6 +623,10 @@ buildInplaceUnpackedPackage
                     runRegister
                       (elabRegisterPackageDBStack pkg)
                       Cabal.defaultRegisterOptions
+                  -- Keep the per-project running InstalledPackageIndex up to date.
+                  -- See (ProjIPI3) from Note [Per-project InstalledPackageIndex]
+                  -- in Distribution.Client.ProjectBuilding.
+                  atomically $ modifyTVar ipiTVar (PackageIndex.insert ipkg)
                   return (Just ipkg)
                 else return Nothing
 
@@ -701,10 +721,15 @@ buildInplaceUnpackedPackage
       whenReRegister action =
         case buildStatus of
           -- We registered the package already
-          BuildStatusBuild (Just _) _ ->
+          BuildStatusBuild (Just mbIPI) _ -> do
             info verbosity "whenReRegister: previously registered"
-          -- There is nothing to register
+            for_ mbIPI $ \ipi ->
+              -- Make sure to keep the running InstalledPackageIndex in sync.
+              -- See (ProjIPI3b) from Note [Per-project InstalledPackageIndex]
+              -- in Distribution.Client.ProjectBuilding.
+              atomically $ modifyTVar ipiTVar (PackageIndex.insert ipi)
           _
+            -- There is nothing to register
             | null (elabBuildTargets pkg) ->
                 info verbosity "whenReRegister: nothing to register"
             | otherwise -> action
@@ -729,6 +754,7 @@ buildAndInstallUnpackedPackage
   -> ElaboratedSharedConfig
   -> ElaboratedInstallPlan
   -> ElaboratedReadyPackage
+  -> TVar InstalledPackageIndex
   -> SymbolicPath CWD (Dir Pkg)
   -> SymbolicPath Pkg (Dir Dist)
   -> IO BuildResult
@@ -748,6 +774,7 @@ buildAndInstallUnpackedPackage
     }
   plan
   rpkg@(ReadyPackage pkg)
+  ipiTVar
   srcdir
   builddir = do
     createDirectoryIfMissingVerbose verbosity True (interpretSymbolicPath (Just srcdir) builddir)
@@ -775,6 +802,7 @@ buildAndInstallUnpackedPackage
       pkgshared
       plan
       rpkg
+      ipiTVar
       srcdir
       builddir
       mlogFile
@@ -790,7 +818,7 @@ buildAndInstallUnpackedPackage
           noticeProgress ProgressHaddock
           _monitors <- runHaddock
           return ()
-        PBInstallPhase{runCopy, runRegister} -> do
+        PBInstallPhase{runCopy, runRegister, getInstalledPackageInfo} -> do
           noticeProgress ProgressInstalling
 
           let registerPkg
@@ -804,14 +832,13 @@ buildAndInstallUnpackedPackage
                           == storePackageDBStack compiler (elabPackageDbs pkg)
                       )
                       (return ())
-                    _ <-
+                    void $
                       runRegister
                         (elabRegisterPackageDBStack pkg)
                         Cabal.defaultRegisterOptions
                           { Cabal.registerMultiInstance = True
                           , Cabal.registerSuppressFilesCheck = True
                           }
-                    return ()
 
           -- Actual installation
           void $
@@ -822,6 +849,15 @@ buildAndInstallUnpackedPackage
               uid
               (copyPkgFiles verbosity pkgshared pkg runCopy)
               registerPkg
+
+          -- Keep the per-project running InstalledPackageIndex TVar up to date.
+          -- This must run regardless of whether newStoreEntry won or lost the
+          -- race.
+          --
+          -- See (ProjIPI3) in Note [Per-project InstalledPackageIndex].
+          when (elabRequiresRegistration pkg) $ do
+            ipkg <- getInstalledPackageInfo
+            atomically $ modifyTVar ipiTVar (PackageIndex.insert ipkg)
 
         -- No tests on install
         PBTestPhase{} -> return ()
